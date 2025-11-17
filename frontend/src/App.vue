@@ -1,153 +1,443 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, onBeforeUnmount } from 'vue'
 
-const str = ref('')
-const serverReply = ref('')         // 用来显示后端返回值（测试用）
-const todos = ref([
-  { id: 1, text: '吃饭', done: true },
-  { id: 2, text: '吃饭', done: false },
-  { id: 3, text: '吃饭', done: false }
-])
+// 页面模式：idle = 初始页面, monitor = 诊断中
+const mode = ref('idle')
 
-function nextId() {
-  return Date.now() + Math.floor(Math.random() * 1000)
+// 是否在轮询
+const isRunning = ref(false)
+
+// 最新一帧 OBD 数据
+const liveData = ref({
+  rpm: 0,
+  speed: 0,
+  coolantTemp: 0,
+  throttle: 0,
+  fuelPressure: 0,
+  batteryVoltage: 0,
+  hasActiveDtc: false,
+  dtcList: []         
+})
+const dtcDescriptionMap = {
+  P0117: '冷却水温センサー回路の電圧が低すぎます。',
+  P0300: 'ランダム／複数気筒でミスファイアが検出されました。',
+  P0420: '触媒システム効率が規定値以下です（触媒コンバータ劣化など）。'
+  // 以后想到别的故障码，可以继续往这里加
 }
 
-async function add() {
-  // 1) 前端本地逻辑：把输入加入 todos（你可以按需修改）
-  const text = (str.value || '').trim()
-  if (!text) {
-    alert('请输入内容')
-    return
-  }
-  todos.value.unshift({ id: nextId(), text, done: false })
-  str.value = ''
+const getDtcDescription = (code) => {
+  return dtcDescriptionMap[code] || '説明：未登録のDTCコードです。'
+}
 
-  // 2) 测试后端连通：请求后端 hello 接口并显示返回（可选）
+
+
+const showDtcDetail = ref(false)
+
+// 清除 DTC 按钮状态
+const isClearing = ref(false)
+
+// 定时器 ID
+let timerId = null
+
+// 点击「診断を開始」
+const startMonitoring = () => {
+  if (isRunning.value) return
+
+  mode.value = 'monitor'
+  isRunning.value = true
+
+  // 立即请求一次
+  fetchLiveData()
+
+  // 之后每 1 秒请求一次
+  timerId = setInterval(fetchLiveData, 1000)
+}
+
+// 请求后端 /api/obd/live
+const fetchLiveData = async () => {
   try {
-    // 如果你在 vite.config.js 配置了 proxy '/api' -> 'http://localhost:8080'
-    // 可以把下面改为 fetch('/api/hello')
-    const res = await fetch('http://localhost:8080/hello')
-    if (res.ok) {
-      const txt = await res.text()
-      serverReply.value = txt
-    } else {
-      serverReply.value = `后端返回错误: ${res.status}`
+    // 如果以后在 vite.config.js 里配置了代理 '/api' -> 'http://localhost:8080'
+    // 这里可以改成 fetch('/api/obd/live')
+    const res = await fetch('http://localhost:8080/api/obd/live')
+    if (!res.ok) {
+      console.error('后端返回错误', res.status)
+      return
     }
-  } catch (err) {
-    console.error('请求后端失败', err)
-    serverReply.value = '请求后端失败（看控制台）'
+    const data = await res.json()
+    liveData.value = data
+  } catch (e) {
+    console.error('获取 OBD 数据失败', e)
   }
 }
 
-// 删除 item
-function remove(id) {
-  todos.value = todos.value.filter(t => t.id !== id)
+// 点击「故障コードをクリア」
+const clearDtc = async () => {
+  if (!liveData.value.hasActiveDtc || isClearing.value) return
+
+  isClearing.value = true
+  try {
+    await fetch('http://localhost:8080/api/obd/dtc/clear', {
+      method: 'POST'
+    })
+    // 清除后，下一轮 /live 会返回 hasActiveDtc = false
+  } catch (e) {
+    console.error('清除 DTC 失败', e)
+  } finally {
+    isClearing.value = false
+  }
 }
 
-// 切换完成状态
-function toggleDone(item) {
-  item.done = !item.done
-}
+// 组件销毁时停止轮询
+onBeforeUnmount(() => {
+  if (timerId) {
+    clearInterval(timerId)
+  }
+})
 </script>
 
 <template>
-  <div class="todo-app">
-    <div class="title">ランのAPP</div>
+  <div class="page">
+    <div class="app-card">
+      <!-- 标题 -->
+      <div class="title">Web アプリ OBD 車両診断システム（シミュレーター）</div>
 
-    <div class="todo-from">
-      <input v-model="str" class="todo-input" type="text" placeholder="ID">
-      <div @click="add" class="todo-button">add Todo</div>
-    </div>
-
-    <!-- 显示后端返回（测试用） -->
-    <div style="margin-left:30px; margin-top:10px; color: #1a73e8;">
-      後端返回：<strong>{{ serverReply }}</strong>
-    </div>
-
-    <!-- 动态渲染 todos -->
-    <div v-for="item in todos" :key="item.id" :class="['item1', { completed: item.done }]">
-      <div class="hezi">
-        <input type="checkbox" :checked="item.done" @change="toggleDone(item)" />
-        <div class="name" style="margin-left:10px">{{ item.text }}</div>
+      <!-- 初始页面：开始诊断 -->
+      <div v-if="mode === 'idle'" class="idle-area">
+        <p class="desc">
+          ECU からの OBD-Iデータを模擬し、車両状態をリアルタイムに表示します。
+        </p>
+        <p class="desc">
+          Desingned by Luan ZhengYuan
+        </p>
+        <button class="primary-btn" @click="startMonitoring">
+          診断を開始
+        </button>
       </div>
-      <div class="del" @click="remove(item.id)">del</div>
+
+      <!-- 监控页面 -->
+      <div v-else class="monitor-area">
+        <!-- 状态栏 -->
+        <div class="status-bar">
+          <div>
+            OBD 状態：
+            <span v-if="liveData.hasActiveDtc" class="badge danger">
+              🚨 Fault detected
+            </span>
+            <span v-else class="badge ok">
+              ✅ Connected / Normal
+            </span>
+          </div>
+          <div class="status-sub">
+            更新間隔: 1s（自動更新中）
+          </div>
+        </div>
+
+        <!-- “仪表盘”（先用卡片 + 数字，之后可以换成真仪表盘） -->
+        <div class="cards">
+          <div class="card">
+            <h3>エンジン回転数</h3>
+            <p class="value">{{ liveData.rpm }} rpm</p>
+          </div>
+          <div class="card">
+            <h3>車速</h3>
+            <p class="value">{{ liveData.speed }} km/h</p>
+          </div>
+          <div class="card">
+            <h3>冷却水温</h3>
+            <p class="value">{{ liveData.coolantTemp }} ℃</p>
+          </div>
+          <div class="card">
+            <h3>スロットル開度</h3>
+            <p class="value">{{ liveData.throttle }} %</p>
+          </div>
+          <div class="card">
+            <h3>燃料圧力</h3>
+            <p class="value">{{ liveData.fuelPressure }} kPa</p>
+          </div>
+          <div class="card">
+            <h3>バッテリー電圧</h3>
+            <p class="value">
+              {{ liveData.batteryVoltage.toFixed ? liveData.batteryVoltage.toFixed(2) : liveData.batteryVoltage }} V
+            </p>
+          </div>
+        </div>
+
+       
+        <!-- 故障提示 + 清除 + 詳細ボタン -->
+<div class="dtc-row">
+  <div>
+    <div v-if="liveData.hasActiveDtc" class="dtc-warning">
+      現在、ECU から故障フラグが報告されています。
+      <span class="dtc-count">
+        （{{ liveData.dtcList.length }} 件のDTC）
+      </span>
+    </div>
+    <div v-else class="dtc-normal">
+      アクティブな故障コードはありません。
+    </div>
+  </div>
+
+  <div class="dtc-actions">
+    <button
+      class="secondary-btn"
+      :disabled="!liveData.hasActiveDtc || isClearing"
+      @click="clearDtc"
+    >
+      {{ isClearing ? 'クリア中...' : '故障コードをクリア' }}
+    </button>
+
+    <button
+      class="link-btn"
+      :disabled="!liveData.dtcList.length"
+      @click="showDtcDetail = true"
+    >
+      詳細を見る
+    </button>
+  </div>
+</div>
+<!-- DTC 詳細モーダル（集中展示用） -->
+<div v-if="showDtcDetail" class="dtc-modal-backdrop" @click.self="showDtcDetail = false">
+  <div class="dtc-modal">
+    <div class="dtc-modal-header">
+      <h2>DTC 詳細</h2>
+      <button class="close-btn" @click="showDtcDetail = false">×</button>
     </div>
 
-    <!-- 空列表提示 -->
-    <div v-if="todos.length === 0" style="text-align:center; margin-top:30px; color:gray">
-      まだTodoがありません
+    <div class="dtc-modal-body">
+      <ul v-if="liveData.dtcList.length">
+        <li v-for="code in liveData.dtcList" :key="code" class="dtc-item">
+  <div class="dtc-code">{{ code }}</div>
+  <div class="dtc-desc">
+    {{ getDtcDescription(code) }}
+  </div>
+</li>
+
+      </ul>
+      <p v-else>
+        現在アクティブな故障コードはありません。
+      </p>
+    </div>
+  </div>
+</div>   
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-body{
-background:linear-gradient(to right,purple,blue) ;
+/* 保留你原来的渐变背景风格 */
+.page {
+  min-height: 100vh;
+  background: linear-gradient(to right, purple, blue);
+  display: flex;
+  align-items: center;      /* ⬅ 垂直居中 */
+  justify-content: center;  /* 水平居中 */
 }
-.todo-app{
-    width: 98%;
-    /* 用 auto 高度让内容扩展 */
-    min-height: 300px;
-    padding: 30px;
-    box-sizing: border-box;
-    background-color: aliceblue;
-    border-radius: 5px;
-    margin-top: 40px;
-    margin-left: 1%;
+
+
+.app-card {
+  width: 96%;
+  max-width: 960px;
+  margin-top: 40px;
+  background-color: aliceblue;
+  border-radius: 8px;
+  padding: 24px 28px 32px;
+  box-sizing: border-box;
 }
-.title{
-    font-size: 30px;
-    font-weight: 700px;
-    text-align: center;
+
+
+
+
+.title {
+  font-size: 24px;
+  font-weight: 700;
+  text-align: center;
 }
-.todo-from{
-    display: flex;
-    margin-top: 20px;
-    margin-left: 30px;
+
+.idle-area {
+  text-align: center;
+  margin-top: 40px;
 }
-.todo-input{
-    border: 1px solid darkgrey;
-    outline: none;
-    width: 60%;
-    height: 50px;
-    border-radius: 20px 0 0 20px;
-    padding-left: 15px;
-    margin-bottom: 20px;
+
+.desc {
+  margin-bottom: 16px;
+  color: #4b5563;
 }
-.todo-button{
-    width: 100px;
-    height: 54px;
-    border-radius: 0 20px 20px 0;
-    color: aliceblue;
-    background:linear-gradient(to right,purple,blue) ;
-    text-align: center;
-    line-height: 54px;
-    cursor: pointer;
-    user-select: none;
+
+.primary-btn,
+.secondary-btn {
+  padding: 10px 20px;
+  border-radius: 999px;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
 }
-.item1{
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    box-sizing: border-box;
-    width: 80%;
-    height: 50px;
-    margin: 8px auto;
-    padding: 16px;
-    border-radius: 20px 20px 20px 20px;
-    box-shadow: rgba(149, 157, 165, 0.2) 0px 8px 20px;
+
+.primary-btn {
+  background: linear-gradient(to right, purple, blue);
+  color: #fff;
 }
-.hezi{
-    display: flex;
-    align-items: center;
+
+.secondary-btn {
+  background: #e5e7eb;
 }
-.del{
-    color: red;
-    cursor: pointer;
+
+.secondary-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
-.completed{
-    text-decoration: line-through;
-    opacity: 0.4;
+
+.monitor-area {
+  margin-top: 24px;
 }
+
+.status-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 16px;
+}
+
+.badge {
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+}
+
+.badge.ok {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.badge.danger {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.status-sub {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.dtc-list {
+  margin-top: 20px;
+  background: #ffffff;
+  padding: 16px;
+  border-radius: 8px;
+  box-shadow: rgba(149, 157, 165, 0.15) 0px 2px 6px;
+}
+
+.dtc-list ul {
+  margin-left: 18px;
+}
+
+.dtc-list li {
+  margin-bottom: 6px;
+  font-size: 15px;
+}
+
+
+.card {
+  background: #f9fafb;
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: rgba(149, 157, 165, 0.2) 0px 4px 10px;
+}
+
+.card h3 {
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+
+.value {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.dtc-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dtc-warning {
+  color: #b91c1c;
+}
+
+.dtc-normal {
+  color: #065f46;
+}
+/* ---- DTC 詳細モーダル ---- */
+.dtc-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.4);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 50;
+}
+
+.dtc-modal {
+  width: min(960px, 100% - 32px); /* 和 app-card 同一宽度策略 */
+  max-height: 80vh;
+  background: #f9fafb;
+  border-radius: 12px;
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.3);
+  display: flex;
+  flex-direction: column;
+}
+
+
+
+.dtc-modal-header {
+  padding: 12px;
+  background: #f3f4f6;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+}
+
+.dtc-modal-body {
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.dtc-item {
+  margin-bottom: 12px;
+}
+
+.dtc-code {
+  font-weight: bold;
+  font-size: 16px;
+}
+
+.dtc-desc {
+  font-size: 13px;
+  color: #4b5563;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: #2563eb;
+  cursor: pointer;
+  font-size: 14px;
+}
+
 </style>
